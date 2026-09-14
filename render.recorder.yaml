@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: zuikaku-discord-recorder
+    runtime: docker
+    dockerfilePath: ./recorder/Dockerfile
+    dockerContext: ./recorder
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: RECORDING_RESULT_CHANNEL_ID
+        sync: false
+      - key: RECORDER_SHARED_SECRET
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_PUBLIC_BASE_URL
+        sync: false
