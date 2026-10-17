@@ -1,13 +1,22 @@
+import { Hibiki } from "@hibiki-js/core";
+import { discord } from "@hibiki-js/discord";
 import {
+  BAN_MESSAGE_INPUT_ID,
   DiscordApiError,
   type DiscordInteraction,
   type DiscordRole,
   EPHEMERAL_FLAG,
+  banGuildMember,
+  banModalResponse,
   discordRequest,
+  getGuildOwnerId,
   getInteractionUserId,
+  getModalTextInput,
   getOption,
   hasAdministratorPermission,
+  parseBanModalTargetUserId,
   selectHighestRole,
+  sendDirectMessage,
   updateOriginalInteractionResponse,
 } from "./discord";
 import { createCertificatePdf } from "./pdf";
@@ -15,7 +24,8 @@ import { DiscordGateway } from "./gateway";
 
 const PING = 1;
 const APPLICATION_COMMAND = 2;
-const DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = 5;
+const MODAL_SUBMIT = 5;
+const DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = 5; // InteractionCallbackType; same numeric value as MODAL_SUBMIT
 const FONT_OBJECT_KEY = "fonts/NotoSansJP-Regular.ttf";
 export type WorkerSecrets = {
   DISCORD_BOT_TOKEN: string;
@@ -45,47 +55,65 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    const rawBody = await request.text();
-    const isValid = await verifyDiscordSignature(request.headers, rawBody, env.DISCORD_PUBLIC_KEY);
-    if (!isValid) {
-      console.log(JSON.stringify({ event: "interaction_rejected", reason: "invalid_signature" }));
-      return new Response("Invalid request signature", { status: 401 });
-    }
-
-    let interaction: DiscordInteraction;
     try {
-      interaction = JSON.parse(rawBody) as DiscordInteraction;
+      return await createDiscordInteractionApp(env, ctx).handle(request, { provider: "discord" });
     } catch {
-      return new Response("Invalid JSON", { status: 400 });
+      console.error(JSON.stringify({ event: "interaction_configuration_error" }));
+      return new Response("configuration error", { status: 500 });
     }
-
-    if (interaction.type === PING) {
-      ctx.waitUntil(env.DISCORD_GATEWAY.getByName(env.GUILD_ID).start());
-      return json({ type: PING });
-    }
-    if (interaction.type !== APPLICATION_COMMAND) {
-      return new Response("Unsupported interaction", { status: 400 });
-    }
-    if (interaction.guild_id !== env.GUILD_ID || interaction.member === undefined) {
-      return ephemeral("このコマンドは指定されたサーバー内でのみ利用できます。");
-    }
-
-    const commandName = interaction.data?.name;
-    if (commandName === "issue") {
-      ctx.waitUntil(issueCertificate(interaction, env));
-      return deferredEphemeral();
-    }
-    if (commandName === "register") {
-      ctx.waitUntil(registerVolunteerName(interaction, env));
-      return deferredEphemeral();
-    }
-    if (commandName === "start" || commandName === "stop") {
-      ctx.waitUntil(dispatchRecordingCommand(interaction, env, commandName));
-      return deferredEphemeral();
-    }
-    return ephemeral("未対応のコマンドです。");
   },
 };
+
+export function createDiscordInteractionApp(env: WorkerEnv, ctx: ExecutionContext) {
+  const handle = ({ event }: { event: unknown }) => {
+    if (!isDiscordInteraction(event)) return new Response("Invalid interaction", { status: 400 });
+    return handleVerifiedInteraction(event, env, ctx);
+  };
+  return new Hibiki({ strictEvents: true })
+    .use(discord({ publicKey: env.DISCORD_PUBLIC_KEY }))
+    .on("discord.ping", () => {
+      ctx.waitUntil(env.DISCORD_GATEWAY.getByName(env.GUILD_ID).start());
+      return json({ type: PING });
+    })
+    .on("discord.application_command", handle)
+    .on("discord.modal_submit", handle)
+    .on("discord.message_component", handle)
+    .on("discord.application_command_autocomplete", handle);
+}
+
+async function handleVerifiedInteraction(interaction: DiscordInteraction, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
+  if (interaction.guild_id !== env.GUILD_ID || interaction.member === undefined) {
+    return ephemeral("このコマンドは指定されたサーバー内でのみ利用できます。");
+  }
+  if (interaction.type === MODAL_SUBMIT) {
+    if (parseBanModalTargetUserId(interaction.data?.custom_id) === undefined) {
+      return ephemeral("未対応のフォームです。");
+    }
+    ctx.waitUntil(completeBanFromModal(interaction, env));
+    return deferredEphemeral();
+  }
+  if (interaction.type !== APPLICATION_COMMAND) {
+    return new Response("Unsupported interaction", { status: 400 });
+  }
+
+  const commandName = interaction.data?.name;
+  if (commandName === "issue") {
+    ctx.waitUntil(issueCertificate(interaction, env));
+    return deferredEphemeral();
+  }
+  if (commandName === "register") {
+    ctx.waitUntil(registerVolunteerName(interaction, env));
+    return deferredEphemeral();
+  }
+  if (commandName === "start" || commandName === "stop") {
+    ctx.waitUntil(dispatchRecordingCommand(interaction, env, commandName));
+    return deferredEphemeral();
+  }
+  if (commandName === "ban") {
+    return openBanModal(interaction, env);
+  }
+  return ephemeral("未対応のコマンドです。");
+}
 
 async function dispatchRecordingCommand(
   interaction: DiscordInteraction,
@@ -174,6 +202,84 @@ async function registerVolunteerName(interaction: DiscordInteraction, env: Worke
   } catch (error) {
     await safelyUpdate(interaction, "氏名の登録中にエラーが発生しました。");
     logOutcome("profile_update_failed", userId, errorMessage(error));
+  }
+}
+
+async function openBanModal(interaction: DiscordInteraction, env: WorkerEnv): Promise<Response> {
+  const actorId = getInteractionUserId(interaction);
+  const targetUserId = getOption(interaction, "user");
+  const guildId = interaction.guild_id;
+  if (actorId === undefined || targetUserId === undefined || guildId === undefined) {
+    return ephemeral("ユーザーを正しく指定してください。");
+  }
+
+  try {
+    const ownerId = await getGuildOwnerId(guildId, env.DISCORD_BOT_TOKEN);
+    if (actorId !== ownerId) {
+      logOutcome("ban_denied", targetUserId, "not_guild_owner");
+      return ephemeral("このコマンドはサーバーオーナーのみが使用できます。");
+    }
+    if (targetUserId === actorId || targetUserId === ownerId) {
+      return ephemeral("サーバーオーナーはBANできません。");
+    }
+    if (targetUserId === interaction.application_id) {
+      return ephemeral("このBot自身はBANできません。");
+    }
+    return json(banModalResponse(targetUserId));
+  } catch (error) {
+    logOutcome("ban_modal_open_failed", targetUserId, errorMessage(error));
+    return ephemeral("BANフォームを開けませんでした。しばらくしてからもう一度お試しください。");
+  }
+}
+
+async function completeBanFromModal(interaction: DiscordInteraction, env: WorkerEnv): Promise<void> {
+  const actorId = getInteractionUserId(interaction);
+  const targetUserId = parseBanModalTargetUserId(interaction.data?.custom_id);
+  const message = getModalTextInput(interaction, BAN_MESSAGE_INPUT_ID)?.trim();
+  const guildId = interaction.guild_id;
+  if (actorId === undefined || targetUserId === undefined || message === undefined || message.length === 0 || guildId === undefined) {
+    await safelyUpdate(interaction, "ユーザーとメッセージを正しく指定してください。");
+    return;
+  }
+
+  try {
+    const ownerId = await getGuildOwnerId(guildId, env.DISCORD_BOT_TOKEN);
+    if (actorId !== ownerId) {
+      await safelyUpdate(interaction, "このコマンドはサーバーオーナーのみが使用できます。");
+      logOutcome("ban_denied", targetUserId, "not_guild_owner");
+      return;
+    }
+    if (targetUserId === actorId || targetUserId === ownerId) {
+      await safelyUpdate(interaction, "サーバーオーナーはBANできません。");
+      return;
+    }
+    if (targetUserId === interaction.application_id) {
+      await safelyUpdate(interaction, "このBot自身はBANできません。");
+      return;
+    }
+
+    let dmSent = true;
+    try {
+      await sendDirectMessage(targetUserId, message, env.DISCORD_BOT_TOKEN);
+    } catch (error) {
+      dmSent = false;
+      console.log(JSON.stringify({ event: "ban_dm_failed", user_id: targetUserId, error: errorMessage(error) }));
+    }
+
+    await banGuildMember(guildId, targetUserId, env.DISCORD_BOT_TOKEN, message);
+    await safelyUpdate(
+      interaction,
+      dmSent
+        ? `<@${targetUserId}> をBANし、指定メッセージをDMで送信しました。`
+        : `<@${targetUserId}> をBANしました。DMは送信できませんでした（相手がDMを拒否している可能性があります）。`,
+    );
+    logOutcome("member_banned", targetUserId, dmSent ? "dm_sent" : "dm_failed");
+  } catch (error) {
+    const messageText = error instanceof DiscordApiError && error.status === 403
+      ? "BANに失敗しました。BotにBAN権限があるか、対象より上位のロールかを確認してください。"
+      : "BAN処理中にエラーが発生しました。";
+    await safelyUpdate(interaction, messageText);
+    logOutcome("ban_failed", targetUserId, errorMessage(error));
   }
 }
 
@@ -285,35 +391,39 @@ function logOutcome(event: string, userId: string, reason?: string): void {
   console.log(JSON.stringify({ event, user_id: userId, ...(reason === undefined ? {} : { reason }) }));
 }
 
-export async function verifyDiscordSignature(headers: Headers, rawBody: string, publicKeyHex: string): Promise<boolean> {
-  const signatureHex = headers.get("X-Signature-Ed25519");
-  const timestamp = headers.get("X-Signature-Timestamp");
-  if (signatureHex === null || timestamp === null || !isHex(signatureHex) || !isHex(publicKeyHex)) {
-    return false;
-  }
-  try {
-    const publicKey = await crypto.subtle.importKey("raw", hexToArrayBuffer(publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
-    return crypto.subtle.verify(
-      { name: "Ed25519" },
-      publicKey,
-      hexToArrayBuffer(signatureHex),
-      toArrayBuffer(new TextEncoder().encode(timestamp + rawBody)),
-    );
-  } catch {
-    return false;
-  }
+// Hibiki verifies the envelope; validate the fields consumed by command handlers.
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function isHex(value: string): boolean {
-  return value.length % 2 === 0 && /^[0-9a-f]+$/iu.test(value);
-}
-
-function hexToArrayBuffer(value: string): ArrayBuffer {
-  const output = new Uint8Array(value.length / 2);
-  for (let index = 0; index < output.length; index += 1) {
-    output[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+function isDiscordInteraction(value: unknown): value is DiscordInteraction {
+  if (!isRecord(value) || typeof value.type !== "number" || typeof value.id !== "string"
+    || typeof value.token !== "string" || typeof value.application_id !== "string") return false;
+  if (value.guild_id !== undefined && typeof value.guild_id !== "string") return false;
+  if (value.user !== undefined && (!isRecord(value.user) || typeof value.user.id !== "string")) return false;
+  if (value.member !== undefined) {
+    const member = value.member;
+    if (!isRecord(member) || !isRecord(member.user) || typeof member.user.id !== "string"
+      || !Array.isArray(member.roles) || !member.roles.every(role => typeof role === "string")
+      || typeof member.joined_at !== "string"
+      || (member.permissions !== undefined && typeof member.permissions !== "string")) return false;
   }
-  return toArrayBuffer(output);
+  if (value.data !== undefined) {
+    const data = value.data;
+    if (!isRecord(data) || (data.name !== undefined && typeof data.name !== "string")
+      || (data.custom_id !== undefined && typeof data.custom_id !== "string")) return false;
+    if (data.options !== undefined && (!Array.isArray(data.options) || !data.options.every(option =>
+      isRecord(option) && typeof option.name === "string"
+      && (option.value === undefined || typeof option.value === "string")
+      && (option.type === undefined || typeof option.type === "number")))) return false;
+    if (data.components !== undefined && (!Array.isArray(data.components) || !data.components.every(row =>
+      isRecord(row) && typeof row.type === "number"
+      && (row.components === undefined || (Array.isArray(row.components) && row.components.every(component =>
+        isRecord(component) && typeof component.type === "number"
+        && (component.custom_id === undefined || typeof component.custom_id === "string")
+        && (component.value === undefined || typeof component.value === "string"))))))) return false;
+  }
+  return true;
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {

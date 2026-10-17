@@ -22,6 +22,15 @@ const commands = [
   },
   { name: "start", description: "参加中のボイスチャンネルの録音を開始します", type: 1 },
   { name: "stop", description: "進行中の録音を停止して保存します", type: 1 },
+  {
+    name: "ban",
+    description: "サーバーオーナー専用。指定ユーザーをBANし、メッセージをDMします",
+    type: 1,
+    default_member_permissions: "0",
+    options: [
+      { name: "user", description: "BANするユーザー", type: 6, required: true },
+    ],
+  },
 ];
 
 for (const command of commands) {

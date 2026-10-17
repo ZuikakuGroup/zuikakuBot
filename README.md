@@ -150,3 +150,9 @@ Botには対象VCの閲覧・接続・発言、および専用結果チャンネ
 - Bot token はソース、`wrangler.jsonc`、ログに絶対に含めないでください。
 - 構造化ログには個人名を出力せず、DiscordユーザーIDと発行結果だけを記録します。
 - Discord の API 制限や DM 拒否により送信できない場合があります。その場合はユーザーにDM許可後の再実行を案内します。
+
+## Discord受付処理とテスト
+
+Discord Interactionsの署名検証とイベント受付は`@hibiki-js/core`と`@hibiki-js/discord`を使用します。署名の有効期間は前後5分です。コマンドの権限チェック、遅延応答、Gatewayの起動と録音処理はアプリ側で行います。
+
+`npm test`で署名付きリクエストを使ったテストを実行します。`@hibiki-js/testing`の`createWebhookTest(...).emit(request, "discord")`とWorkerの受付処理を通して検証します。公開版のヘルパーはDiscord署名を生成しないため、署名はテスト内で生成します。PING、コマンド・モーダル、権限チェック、署名の改ざん・期限切れを確認します。
